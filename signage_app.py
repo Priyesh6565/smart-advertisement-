@@ -37,18 +37,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 ADS_DIR = os.path.join(BASE_DIR, "ads")
 
-# ---- Model paths (FIXED: no more literal "PATH" placeholders) ----
 PROTO_AGE = os.path.join(MODEL_DIR, "deploy_age.prototxt")
 MODEL_AGE = os.path.join(MODEL_DIR, "age_net.caffemodel")
 PROTO_GENDER = os.path.join(MODEL_DIR, "deploy_gender.prototxt")
 MODEL_GENDER = os.path.join(MODEL_DIR, "gender_net.caffemodel")
 # DNN-based face detector (SSD/ResNet10) -- far more reliable than Haar
-# cascades for multiple people, side angles, and varied lighting, which
-# matters a lot once you're detecting a *group* rather than one face.
+# cascades for multiple people, side angles, and varied lighting.
 PROTO_FACE = os.path.join(MODEL_DIR, "face_detector_deploy.prototxt")
 MODEL_FACE = os.path.join(MODEL_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
 
-FACE_CONFIDENCE_THRESHOLD = 0.5  # lower (e.g. 0.4) if faces at the edges of frame are being missed
+FACE_CONFIDENCE_THRESHOLD = 0.5   # lower (e.g. 0.4) if faces at frame edges are missed
+GENDER_CONFIDENCE_THRESHOLD = 0.65  # below this, treat the call as "Uncertain" rather than force a guess
+FACE_CROP_PADDING = 0.30          # extra margin added around each face box before classifying (see notes below)
 
 MODEL_MEAN_VALUES = (78.4263377603, 87.7689143744, 114.895847746)
 AGE_LIST = ['(0, 2)', '(4, 6)', '(8, 12)', '(15, 20)', '(25, 32)', '(38, 43)', '(48, 53)', '(60, 100)']
@@ -70,10 +70,7 @@ face_net = cv2.dnn.readNetFromCaffe(PROTO_FACE, MODEL_FACE)
 
 
 def detect_faces(frame):
-    """
-    Returns a list of (x, y, w, h) boxes for every face detected above
-    FACE_CONFIDENCE_THRESHOLD, clipped to stay inside the frame.
-    """
+    """Returns [(x, y, w, h), ...] for every face above FACE_CONFIDENCE_THRESHOLD, clipped to frame bounds."""
     h, w = frame.shape[:2]
     blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 1.0, (300, 300),
                                   (104.0, 177.0, 123.0))
@@ -92,6 +89,58 @@ def detect_faces(frame):
         if x2 > x1 and y2 > y1:
             boxes.append((x1, y1, x2 - x1, y2 - y1))
     return boxes
+
+
+def crop_with_padding(frame, box):
+    """
+    The age/gender model was trained on Adience-dataset crops, which include
+    a loose margin around the face (from the original Viola-Jones-style face
+    detector used to build that dataset) -- not a tight bounding box. Feeding
+    it a tight box (like our SSD detector produces) measurably hurts accuracy,
+    especially on angled faces and non-default hairstyles. Padding the crop
+    back out compensates for that mismatch.
+    """
+    x, y, w, h = box
+    frame_h, frame_w = frame.shape[:2]
+    pad_w, pad_h = int(w * FACE_CROP_PADDING), int(h * FACE_CROP_PADDING)
+    x1, y1 = max(x - pad_w, 0), max(y - pad_h, 0)
+    x2, y2 = min(x + w + pad_w, frame_w), min(y + h + pad_h, frame_h)
+    return frame[y1:y2, x1:x2]
+
+
+def predict_age_gender(face_img):
+    """Returns (age_label, gender_label_or_'Uncertain', gender_confidence)."""
+    blob = cv2.dnn.blobFromImage(face_img, 1, (227, 227), MODEL_MEAN_VALUES, swapRB=False)
+    gender_net.setInput(blob)
+    gender_out = gender_net.forward()[0]
+    gender_confidence = float(gender_out.max())
+    gender = GENDER_LIST[gender_out.argmax()]
+    if gender_confidence < GENDER_CONFIDENCE_THRESHOLD:
+        gender = "Uncertain"
+
+    age_net.setInput(blob)
+    age = AGE_LIST[age_net.forward()[0].argmax()]
+    return age, gender, gender_confidence
+
+
+def decide_category_by_ratio(male_count, female_count, tie_toggle):
+    """
+    Audience-ratio based ad selection (mirrors the 'Audience Analysis' +
+    'Ad Rotation' modules in the SRS):
+      - majority gender in front of the camera right now wins
+      - "Uncertain" faces are excluded from the count entirely rather than
+        guessed, so a genuinely ambiguous read doesn't skew the majority
+      - on an exact tie, alternate fairly between male/female instead of
+        always favoring one
+    Returns (category, updated_tie_toggle)
+    """
+    if male_count == 0 and female_count == 0:
+        return "generic", tie_toggle
+    if male_count > female_count:
+        return "male", tie_toggle
+    if female_count > male_count:
+        return "female", tie_toggle
+    return ("male" if tie_toggle else "female"), (not tie_toggle)
 
 
 def load_ads(category):
@@ -130,38 +179,7 @@ def get_current_ad_frame(category, index):
     return img
 
 
-def predict_age_gender(face_img):
-    blob = cv2.dnn.blobFromImage(face_img, 1, (227, 227), MODEL_MEAN_VALUES, swapRB=False)
-    gender_net.setInput(blob)
-    gender = GENDER_LIST[gender_net.forward()[0].argmax()]
-    age_net.setInput(blob)
-    age = AGE_LIST[age_net.forward()[0].argmax()]
-    return age, gender
-
-
-def decide_category_by_ratio(male_count, female_count, tie_toggle):
-    """
-    Audience-ratio based ad selection (mirrors the 'Audience Analysis' +
-    'Ad Rotation' modules in the SRS):
-      - majority gender in front of the camera right now wins
-      - on an exact tie, alternate fairly between male/female each time
-        this function is called with a tie, instead of always favoring one
-    Returns (category, updated_tie_toggle)
-    """
-    if male_count == 0 and female_count == 0:
-        return "generic", tie_toggle
-    if male_count > female_count:
-        return "male", tie_toggle
-    if female_count > male_count:
-        return "female", tie_toggle
-    # exact tie -> round-robin fairness instead of always picking the same one
-    return ("male" if tie_toggle else "female"), (not tie_toggle)
-
-
 def main():
-    # On macOS, explicitly request the AVFoundation backend -- this is what
-    # actually triggers the camera permission prompt reliably. Falls back to
-    # the default backend on other platforms.
     backend = cv2.CAP_AVFOUNDATION if hasattr(cv2, "CAP_AVFOUNDATION") else cv2.CAP_ANY
     cap = cv2.VideoCapture(0, backend)
     if not cap.isOpened():
@@ -178,9 +196,6 @@ def main():
     cap.set(3, 640)
     cap.set(4, 480)
 
-    # The camera can report "opened" successfully even before macOS grants
-    # permission -- the first several reads may fail while the permission
-    # prompt is pending. Give it a few tries before giving up entirely.
     warm_up_ok = False
     for _ in range(30):
         ok, _ = cap.read()
@@ -214,15 +229,12 @@ def main():
         ok, frame = cap.read()
         if not ok:
             consecutive_failures += 1
-            if consecutive_failures > 30:  # ~1 second of failures at 30fps
+            if consecutive_failures > 30:
                 print("Webcam stopped returning frames. Exiting.")
                 break
             continue
         consecutive_failures = 0
 
-        # DNN-based detection: much better than Haar cascades at picking up
-        # multiple people, side angles, and varied lighting -- important
-        # now that we're analyzing a whole group, not just one face.
         faces = detect_faces(frame)
 
         if len(faces) > 0:
@@ -231,15 +243,20 @@ def main():
             female_count = 0
 
             for (x, y, w, h) in faces:
-                face_img = frame[y:y + h, x:x + w].copy()
-                age, gender = predict_age_gender(face_img)
+                face_img = crop_with_padding(frame, (x, y, w, h))
+                age, gender, conf = predict_age_gender(face_img)
+
                 if gender == "Male":
                     male_count += 1
-                else:
+                    box_color = (0, 0, 255)
+                elif gender == "Female":
                     female_count += 1
+                    box_color = (255, 0, 255)
+                else:
+                    box_color = (128, 128, 128)  # uncertain -> shown but not counted
 
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                cv2.putText(frame, f"{gender}, {age}", (x, max(y - 10, 20)),
+                cv2.rectangle(frame, (x, y), (x + w, y + h), box_color, 2)
+                cv2.putText(frame, f"{gender}, {age} ({conf:.0%})", (x, max(y - 10, 20)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
             current_category, tie_toggle = decide_category_by_ratio(male_count, female_count, tie_toggle)

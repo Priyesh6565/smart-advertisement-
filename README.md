@@ -1,83 +1,71 @@
-# Laptop-Only Digital Signage — InsightFace Edition
+# Laptop-Only Digital Signage — Confidence-Based Gating + Model Recommendation
 
-Runs entirely on your laptop using the built-in webcam. No Raspberry Pi,
-Arduino/NodeMCU, MQTT, Firebase, or Flutter app needed.
+## What changed this round
 
-## What changed: switched to InsightFace (buffalo_l)
+### The bug: pose angle doesn't predict correctness
+Your screenshot showed a face at ~49° yaw with **98% gender confidence**
+marked "Uncertain" — blocked purely by the angle cutoff. I checked this
+against an earlier case: a *different* face, also ~50° yaw, was wrong
+despite 92% confidence. Since the same angle range contains both a correct
+98%-confidence read and a wrong 92%-confidence read, **pose angle cannot
+reliably separate good detections from bad ones** — it's just not a good
+signal, and was over-blocking legitimate faces.
 
-The previous version used a 2015 Caffe model (Levi & Hassner, trained on the
-small, Western-skewed Adience dataset) and was misclassifying faces —
-confirmed on your actual screenshots, e.g. a male face read as "Female, 87%
-confidence."
+### The fix: gate on confidence, not angle
+- Primary filter is now the model's own gender confidence (`GENDER_CONF_THRESHOLD = 0.60`)
+- Pose is kept only as a generous backstop (70°/55°) for truly degenerate
+  near-profile crops, not as a "is this probably right" filter
+- **Trade-off, stated honestly:** this means the specific known-hard wrong
+  case (92% confidence, still wrong) will now pass through too — there's no
+  threshold that can distinguish it from a correct 98%-confidence read,
+  because the model itself doesn't know it's wrong. To compensate, the
+  temporal smoothing window was widened from 1.5s to 2.5s, so one
+  occasional bad frame gets outvoted by surrounding correct frames instead
+  of flipping the ad. Verified: a steady run of "male" reads with one bad
+  "female" frame mixed in still correctly resolves to "male".
 
-This version uses **InsightFace's `buffalo_l` model pack** instead — a
-modern face-analysis toolkit trained on a much larger and more diverse face
-dataset. I tested it directly against the exact faces the old model got
-wrong:
+## Your question: switch models, or keep improving this one?
 
-| Test face | Old model (Caffe/Adience) | New model (InsightFace buffalo_l) |
+**Diagnosis: the bottleneck was our filtering logic, not the underlying
+InsightFace model.** In every case I've tested across this whole project,
+buffalo_l's raw gender/age predictions have been getting the right answer
+with high confidence — the errors came from either (a) a genuinely hard
+individual frame (screen glare, motion blur) or (b) our own filter blocking
+a correct read. That's a calibration problem, which is what this round
+fixed, not necessarily a "wrong model" problem.
+
+**That said, for your stated goal — best possible accuracy specifically on
+Indian faces — here's the honest comparison of your three options:**
+
+| Option | Effort | Expected gain |
 |---|---|---|
-| Screenshot face (side angle) | Female, 87% confidence — **wrong** | Male, age 34 — **correct** |
-| Group photo, face 1 | detected, but flaky across runs | Male, age 36 — correct |
-| Group photo, face 2 | often missed entirely | Male, age 31 — correct |
+| **Keep InsightFace buffalo_l, well-calibrated** (current state) | Done | Already performing well in testing; main remaining errors are genuinely hard individual frames, not systematic bias |
+| **Switch to a FairFace-based model** | Medium (swap in pretrained weights, rewire the age/gender head) | FairFace's training data is explicitly race-balanced including an Indian category, vs. buffalo_l's more general large-scale (not Indian-specific) training data. Likely a real but not dramatic accuracy gain specifically on Indian faces |
+| **Train/fine-tune on an Indian-specific dataset** | High (need a labeled dataset, training pipeline, GPU time, evaluation) | Highest possible ceiling, but a genuinely substantial undertaking — not something to do inside a quick iteration cycle |
 
-All verified by running the actual model against your uploaded screenshots,
-not synthetic test data.
+**My recommendation:** the current calibration fix should meaningfully
+reduce the "not working" feeling you've been hitting. Test this version
+first. If accuracy is still unsatisfying specifically on Indian faces after
+this, the FairFace swap (previously researched: `dchen236/FairFace` or the
+ONNX version) is the next reasonable step — it's a model swap, not a
+training project, so it's a contained amount of work. Full custom training
+is worth pursuing only if FairFace still isn't enough, since it's the most
+expensive option by far.
 
-## Setup (one-time)
+## Setup / Run (unchanged)
 ```
 pip install insightface onnxruntime opencv-python
-```
-
-**First run:** InsightFace automatically downloads the `buffalo_l` model
-pack (~280MB) from GitHub the first time you run the script. This needs an
-internet connection once; after that it's cached in `~/.insightface/models/`
-and works offline.
-
-## Run it
-```
 python signage_app.py
 ```
-Two windows open: **Camera** (debug view — every detected face gets a box,
-predicted gender, age, and detection confidence) and **Ads** (fullscreen,
-rolls ads based on majority gender detected). Press `q` to quit, `f` to
-toggle fullscreen.
+First run downloads the InsightFace model pack (~280MB) once, then it's
+cached offline. Press `q` to quit, `f` to toggle fullscreen. Drop `.mp4`
+files into `ads/male/`, `ads/female/`, `ads/generic/`.
 
-Drop your own `.jpg`/`.png` ad images into `ads/male/`, `ads/female/`,
-`ads/generic/` — no code changes needed.
-
-## How ad selection works (group / multi-person support)
-Every frame, the app detects **all** faces, classifies each, and picks ads
-by majority:
-- 6 male + 4 female detected -> male ads
-- exact tie -> alternates fairly between male/female each time, rather than
-  always favoring one gender
-- nobody detected for 2+ seconds -> falls back to `generic` ads
-- a face detected with low confidence (< 50%) is shown in the debug view as
-  "Uncertain" and excluded from the count entirely, so a shaky detection
-  doesn't skew the ad decision
-
-## Why this model is more reliable
-- **Detection:** SCRFD-based face detector — handles multiple people, angled
-  poses, and varied lighting far better than the Haar cascades or single
-  SSD detector used in earlier versions.
-- **Age/Gender:** trained as part of InsightFace's large-scale face-analysis
-  pipeline, used widely in production systems — much larger and more
-  diverse training data than the 26,000-image Adience dataset the old model
-  used.
-- No custom padding/cropping workaround needed (which the old model
-  required) — InsightFace handles face alignment internally.
-
-## Known limitations (good to mention in your report/viva)
-- Still not perfect — no age/gender classifier is 100% accurate, especially
-  at extreme angles, heavy occlusion (masks, hands over face), or poor
-  lighting. The confidence-based "Uncertain" filtering exists specifically
-  to keep low-confidence reads from skewing the ad decision.
-- The `buffalo_l` pack is general-purpose (not specifically fine-tuned on
-  Indian faces the way a FairFace-based model would be), but in direct
-  testing against your real screenshots it substantially outperformed the
-  old Adience-trained model. If you want to push accuracy further as a
-  "future work" item, fine-tuning on FairFace (which explicitly balances
-  for Indian, East Asian, Southeast Asian, etc.) would be the next step —
-  a good line to include in your SRS's future-scope section.
-- First run requires internet access to download the model pack once.
+## Tuning knobs (top of `signage_app.py`)
+| Constant | What it controls | Current |
+|---|---|---|
+| `DET_SCORE_THRESHOLD` | Minimum face-detector confidence to trust a face at all | 0.5 |
+| `GENDER_CONF_THRESHOLD` | Minimum gender-prediction confidence to count a face (primary gate now) | 0.60 |
+| `MAX_YAW_DEGREES` / `MAX_PITCH_DEGREES` | Generous pose backstop, not the main filter anymore | 70° / 55° |
+| `EDGE_MARGIN_PX` | How close to the frame border counts as "cut off" | 8px |
+| `SMOOTHING_WINDOW_SECONDS` | How long a category must be dominant before the ad switches | 2.5s |

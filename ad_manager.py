@@ -1,15 +1,13 @@
 """
 Targeted Video Ad Player with Hierarchical Fallback and FPS Pacing
 ------------------------------------------------------------------
-Solves two critical issues:
-1. Video speed pacing: Paces frame decoding using wall-clock time so video plays
-   at its native 25/30 FPS regardless of webcam/inference loop speed.
-2. Hierarchical fallback search:
-   ads/<gender>/<age_bracket>/ -> ads/<gender>/ -> ads/generic/
+1. Video speed pacing using wall-clock time (native 25/30 FPS).
+2. Hierarchical fallback: ads/<gender>/<age>/ -> ads/<gender>/ -> ads/generic/
+3. NEW: on_play callback (play logging for billing), release_media() and reload()
+   so the Supabase sync can add/remove ads while the app is running.
 """
 
 import os
-import glob
 import time
 import cv2
 import numpy as np
@@ -20,11 +18,12 @@ ALL_MEDIA_EXTENSIONS = VIDEO_EXTENSIONS + IMAGE_EXTENSIONS
 
 
 class TargetedAdPlayer:
-    def __init__(self, ads_dir=None):
+    def __init__(self, ads_dir=None, on_play=None):
         if ads_dir is None:
             base_dir = os.path.dirname(os.path.abspath(__file__))
             ads_dir = os.path.join(base_dir, "ads")
         self.ads_dir = ads_dir
+        self.on_play = on_play  # callable(media_path) fired each time an ad starts
         self.current_folder = None
         self.media_files = []
         self.media_index = 0
@@ -43,6 +42,7 @@ class TargetedAdPlayer:
         self._ensure_default_folders()
         self.set_target("generic", "generic")
 
+    # ------------------------------------------------------------------ setup
     def _ensure_default_folders(self):
         """Ensures the basic folder structure exists."""
         for sub in ["male", "female", "generic"]:
@@ -51,6 +51,31 @@ class TargetedAdPlayer:
             for age in ["kids", "teens", "adults", "seniors"]:
                 os.makedirs(os.path.join(folder, age), exist_ok=True)
 
+    def _notify_play(self):
+        if self.on_play and self.current_media_path:
+            try:
+                self.on_play(self.current_media_path)
+            except Exception as e:
+                print(f"[AdPlayer] on_play error: {e}")
+
+    def release_media(self):
+        """Closes any open video file (needed before files can be deleted on Windows)."""
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        self.current_media_path = None
+        self.loaded_image = None
+        self.last_frame = None
+        self.is_image = False
+
+    def reload(self):
+        """Forces the playlist to be re-read from disk on the next frame."""
+        self.release_media()
+        self.current_folder = None
+        self.media_files = []
+        self.media_index = 0
+
+    # ------------------------------------------------------------ resolution
     def resolve_ad_folder(self, gender, age_bracket):
         """
         Hierarchical folder resolution:
@@ -88,6 +113,7 @@ class TargetedAdPlayer:
             pass
         return sorted(files)
 
+    # --------------------------------------------------------------- playback
     def _open_media(self, path):
         """Opens a media file (either video or image)."""
         if self.cap is not None:
@@ -114,6 +140,8 @@ class TargetedAdPlayer:
             fps = self.cap.get(cv2.CAP_PROP_FPS)
             self.video_fps = fps if (fps and 10.0 <= fps <= 60.0) else 30.0
             self.frame_interval = 1.0 / self.video_fps
+
+        self._notify_play()
 
     def _advance_media(self):
         """Advances to the next media item in the current folder playlist."""
@@ -151,13 +179,15 @@ class TargetedAdPlayer:
             if self.loaded_image is None:
                 return self._placeholder("Could not load image ad", gender, age_bracket)
 
-            # Check if duration elapsed and multiple media exist in playlist
-            if len(self.media_files) > 1 and (time.time() - self.image_display_start) > self.image_duration:
-                self._advance_media()
-                if self.loaded_image is not None:
-                    return self.loaded_image
+            if (time.time() - self.image_display_start) > self.image_duration:
+                if len(self.media_files) > 1:
+                    self._advance_media()
+                else:
+                    self.image_display_start = time.time()
+                    self._notify_play()  # same single image shown again = new play
 
-            return self.loaded_image
+            return self.loaded_image if self.loaded_image is not None else \
+                self._placeholder("Could not load image ad", gender, age_bracket)
 
         # Case 2: No video opened
         if self.cap is None or not self.cap.isOpened():
@@ -171,7 +201,6 @@ class TargetedAdPlayer:
 
         ok, frame = self.cap.read()
         if not ok:
-            # If multiple media in playlist, cycle to next
             if len(self.media_files) > 1:
                 self._advance_media()
                 if self.cap is not None and self.cap.isOpened():
@@ -181,10 +210,14 @@ class TargetedAdPlayer:
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ok, frame = self.cap.read()
                 if not ok:
-                    # Fallback reopen if codec fails POS_FRAMES
                     self.cap.release()
-                    self.cap = cv2.VideoCapture(self.current_media_path)
+                    media_path = self.current_media_path
+                    if media_path is None:
+                        return self._placeholder("Error decoding video", gender, age_bracket)
+                    self.cap = cv2.VideoCapture(media_path)
                     ok, frame = self.cap.read()
+                if ok:
+                    self._notify_play()  # looped = played again
 
             if not ok or frame is None:
                 return self._placeholder("Error decoding video", gender, age_bracket)
@@ -200,7 +233,6 @@ class TargetedAdPlayer:
         img = np.zeros((720, 1280, 3), dtype=np.uint8)
         img[:] = (24, 20, 18)
 
-        # Sleek header bar
         cv2.rectangle(img, (0, 0), (1280, 80), (35, 30, 25), -1)
         cv2.putText(img, "SMART DIGITAL SIGNAGE SYSTEM", (50, 52),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.1, (240, 240, 240), 2)
@@ -212,7 +244,7 @@ class TargetedAdPlayer:
         cv2.putText(img, message, (80, 350),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.85, (180, 180, 180), 2)
 
-        hint = "Add video (.mp4) or image (.png, .jpg) to ads/<gender>/<age>/ or ads/<gender>/"
+        hint = "Vendors upload ads from the Flutter portal - they sync here automatically."
         cv2.putText(img, hint, (80, 450),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (120, 120, 120), 1)
 

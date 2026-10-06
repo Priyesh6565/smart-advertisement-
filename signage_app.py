@@ -10,6 +10,7 @@ Pipeline Architecture:
    demographic probability smoothing per person.
 4. Ad Targeting: Multi-tier fallback (ads/<gender>/<age_bracket>/ -> ads/<gender>/ -> ads/generic/).
 5. Paced Media Player: Wall-clock FPS pacing for video ads and timed banner ad rotation.
+6. Supabase Sync: ads uploaded by vendors are downloaded automatically; plays are logged for billing.
 
 Controls:
   'q' -> Quit
@@ -28,6 +29,7 @@ from tracker import FaceTracker
 from fairface_engine import FairFaceEngine, FAIRFACE_AGES, map_bracket_to_category
 from ad_manager import TargetedAdPlayer
 from detector import UnifiedFaceDetector
+from supabase_sync import SupabaseAdSync
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ADS_DIR = os.path.join(BASE_DIR, "ads")
@@ -251,9 +253,16 @@ def main():
         print(f"[Warning] FairFace model not found at {FAIRFACE_MODEL_PATH}.")
         fairface = None
 
-    # 3. Initialize Tracker, Ad Player & Smoother
+    # 3. Initialize Tracker, Ad Player, Supabase Sync & Smoother
     tracker = FaceTracker(iou_threshold=0.3, max_lost_frames=20, min_hits_to_confirm=2, ema_alpha=0.25)
-    ad_player = TargetedAdPlayer(ADS_DIR)
+    ad_sync = SupabaseAdSync(ADS_DIR, interval=15)
+    ad_player = TargetedAdPlayer(ADS_DIR, on_play=ad_sync.log_play)
+    try:
+        ad_sync.sync_once()              # first download before the windows open
+    except Exception as e:
+        print(f"[Sync] Initial sync failed (using local ads): {e}")
+    ad_sync.apply_changes(ad_player)
+    ad_sync.start()                      # keeps syncing in background
     smoother = AudienceTargetSmoother(window_seconds=TARGET_SMOOTHING_SECONDS)
 
     # 4. Open Webcam or Video source
@@ -441,6 +450,7 @@ def main():
             stable_target = smoother.update(raw_target[0], raw_target[1])
 
             # Step 5: Render Ads
+            ad_sync.apply_changes(ad_player)   # picks up new / deleted ads from Supabase
             ad_frame = ad_player.get_frame(stable_target[0], stable_target[1])
             cv2.imshow(ad_win, ad_frame)
 
@@ -467,6 +477,7 @@ def main():
     finally:
         if cap is not None:
             cap.release()
+        ad_sync.stop()
         ad_player.release()
         cv2.destroyAllWindows()
         print("[Shutdown] Cleaned up resources. Goodbye!")
